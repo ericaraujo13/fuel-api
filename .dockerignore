@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+*.sqlite3
+db.sqlite3
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.md
+!README.md
