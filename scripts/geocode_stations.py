@@ -4,6 +4,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,7 +12,8 @@ from dotenv import load_dotenv
 INPUT_FILE = "data/fuel-prices.csv"
 OUTPUT_FILE = "data/stations.json"
 
-URL = "https://maps.googleapis.com/maps/api/geocode/json"
+GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 MAX_WORKERS = 10
 LIMIT_ROWS = int(os.getenv("GEOCODE_LIMIT_ROWS", "0"))
 
@@ -22,6 +24,67 @@ CACHE_FILE = BASE_DIR / "data" / "geocode_cache.json"
 
 def get_google_api_key():
     return os.getenv("GOOGLE_API_KEY")
+
+def _nominatim_throttle_seconds():
+    return float(os.getenv("NOMINATIM_THROTTLE_SECONDS", "1.0"))
+
+def _user_agent():
+    return os.getenv("GEOCODER_USER_AGENT", "fuel-api-geocoder/1.0 (local dev)")
+
+_last_nominatim_call_ts = 0.0
+
+def _geocode_with_google(query: str, api_key: str):
+    params = {
+        "address": query,
+        "key": api_key,
+        "components": "country:US",
+    }
+
+    res = requests.get(GOOGLE_GEOCODE_URL, params=params, timeout=10)
+    data = res.json()
+
+    if data.get("status") == "OK":
+        loc = data["results"][0]["geometry"]["location"]
+        return loc["lat"], loc["lng"]
+
+    print(f"[GOOGLE FAIL] {query} → {data.get('status')}")
+    return None, None
+
+def _geocode_with_nominatim(query: str):
+    global _last_nominatim_call_ts
+
+    now = time.time()
+    wait_s = _nominatim_throttle_seconds() - (now - _last_nominatim_call_ts)
+    if wait_s > 0:
+        time.sleep(wait_s)
+
+    headers = {"User-Agent": _user_agent()}
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": "us",
+    }
+
+    res = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=20)
+    _last_nominatim_call_ts = time.time()
+
+    if res.status_code != 200:
+        print(f"[NOMINATIM FAIL] {query} → HTTP {res.status_code}")
+        return None, None
+
+    data = res.json()
+    if not data:
+        print(f"[NOMINATIM FAIL] {query} → no results")
+        return None, None
+
+    try:
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+        return lat, lon
+    except Exception:
+        print(f"[NOMINATIM FAIL] {query} → parse error")
+        return None, None
 
 def load_cache():
     if CACHE_FILE.exists():
@@ -52,27 +115,15 @@ def geocode(query):
         return lat, lon
 
     api_key = get_google_api_key()
-    if not api_key:
-        raise Exception("Missing GOOGLE_API_KEY (configure it in .env file)")
-
-    params = {
-        "address": query,
-        "key": api_key,
-        "components": "country:US"
-    }
 
     try:
-        res = requests.get(URL, params=params, timeout=10)
-        data = res.json()
+        if api_key:
+            lat, lon = _geocode_with_google(query, api_key)
+        else:
+            lat, lon = _geocode_with_nominatim(query)
 
-        if data.get("status") == "OK":
-            loc = data["results"][0]["geometry"]["location"]
-            lat, lon = loc["lat"], loc["lng"]
-            cache[query] = [lat, lon]
-            return lat, lon
-
-        print(f"[GOOGLE FAIL] {query} → {data.get('status')}")
-
+        cache[query] = [lat, lon]
+        return lat, lon
     except Exception as e:
         print(f"[ERROR] {query} → {e}")
 
@@ -135,6 +186,8 @@ def process_row(i, row):
 
 def main():
     stations = []
+    provider = "google" if get_google_api_key() else "nominatim"
+    print(f"🧭 Geocoder provider: {provider}")
 
     with open(INPUT_FILE) as f:
         rows = list(csv.DictReader(f))
