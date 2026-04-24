@@ -1,14 +1,23 @@
 from .fuel import load_stations
 from .geo import haversine, route_distances
 
+# Basic optimizer heuristics.
 MAX_RANGE = 500
 MPG = 10
 
+# Prevents stops "too early" and defines a window near the range limit
+# to pick a cheaper station without giving up much route progress.
 MIN_STOP_DISTANCE = 100
 FAR_WINDOW = 50
 
 
 def find_nearby_stations(point, stations, radius=20):
+    """Return stations near a route point within a radius.
+
+    - `point` comes from the route coordinates array (lon, lat).
+    - Returns a list of `(station, deviation)` tuples where `deviation` is the
+      distance from the point to the station (via haversine).
+    """
     lat, lon = point[1], point[0]
 
     nearby = []
@@ -21,9 +30,21 @@ def find_nearby_stations(point, stations, radius=20):
 
 
 def compute_fuel_stops(route):
+    """Compute fuel stops and estimated cost along a route.
+
+    Strategy (heuristic):
+    - Walks the route by cumulative distances and, on each iteration, searches
+      for candidate stations within range (`MAX_RANGE`) and after a minimum
+      distance since the last stop (`MIN_STOP_DISTANCE`).
+    - Among candidates, keeps only the "furthest" ones (within `FAR_WINDOW` of
+      the maximum achievable progress) and picks the cheapest.
+    - Estimates consumption using `MPG` (miles per gallon) and accumulates cost.
+    """
     stations = load_stations()
     coords = route["coordinates"]
 
+    # Downsample: reduces the number of points to speed up the search
+    # while keeping a reasonable approximation of the path.
     if len(coords) > 2000:
         coords = coords[::10]
     elif len(coords) > 800:
@@ -38,6 +59,8 @@ def compute_fuel_stops(route):
     max_iters = 100
 
     for _ in range(max_iters):
+        # Stop when we reached the end, or when the remaining segment
+        # fits within the max range without additional stops.
         if current_position >= distances[-1]:
             break
 
@@ -69,6 +92,7 @@ def compute_fuel_stops(route):
                 })
 
         if not candidates:
+            # No candidates within range: we can't suggest a next stop.
             break
 
         max_dist = max(c["distance"] for c in candidates)
@@ -84,6 +108,8 @@ def compute_fuel_stops(route):
         stop_distance = best["distance"]
 
         if stops and stops[-1]["name"] == station["name"]:
+            # Avoid getting stuck repeating the same station (e.g. route
+            # oscillating between nearby points). Move forward a bit and retry.
             current_position += 50
             continue
 
